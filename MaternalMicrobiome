@@ -1,0 +1,143 @@
+# ==============================================================================
+# MOTHER MICROBIOME DIVERSITY ANALYSIS
+# ==============================================================================
+suppressMessages({
+  library("tidyverse")
+  library("phyloseq")
+  library("rstatix")
+  library("vegan")
+  library("picante")
+  library("microbiomeMarker")
+  library("ggpubr")
+  library("patchwork")
+})
+
+# 1. LOAD AND FILTER DATA FOR MOTHERS
+ps <- readRDS("ps_gtdb_final.rds")
+
+# Subset for Mothers and Clean Taxa
+ps.mom <- ps %>%
+  subset_samples(mother_neonate %in% c("mother")) %>%
+  subset_taxa(Kingdom == "Bacteria") %>%
+  subset_taxa(!is.na(Phylum)) %>%
+  subset_taxa(!Class %in% c("Chloroplast")) %>%
+  subset_taxa(!Family %in% c("mitochondria"))
+
+# --- GLOBAL SETTINGS ---
+order_sites <- c("rectal", "vagina", "oral", "skin", "nasal")
+group_colors <- c(
+  "rectal" = "#E69F00", "vagina" = "#56B4E9", "oral" = "#009E73", 
+  "skin" = "#0072B2", "nasal" = "#F0E442"
+)
+
+# --- 2. DATA PREPARATION ---
+# Rounding counts for consistency in alpha metrics
+ps.counts.mom <- ps.mom
+otu_table(ps.counts.mom) <- otu_table(ps.counts.mom) %>% 
+  as.matrix() %>% round() %>% 
+  otu_table(taxa_are_rows = taxa_are_rows(ps.mom))
+
+meta_mom <- as.data.frame(as(sample_data(ps.counts.mom), "data.frame"))
+
+# Calculate Alpha Metrics
+richness_mom <- estimate_richness(ps.counts.mom, measures = c("Shannon", "Observed"))
+otu_mat_mom  <- as(otu_table(ps.counts.mom), "matrix")
+if (taxa_are_rows(ps.counts.mom)) { otu_mat_mom <- t(otu_mat_mom) }
+faith_pd_mom <- pd(otu_mat_mom, phy_tree(ps.counts.mom), include.root = FALSE)
+pielou_mom   <- richness_mom$Shannon / log(richness_mom$Observed)
+
+adiv_mom <- data.frame(
+  richness_mom, FaithPD = faith_pd_mom$PD, Pielou = pielou_mom,
+  all_bodysite = factor(meta_mom$all_bodysite, levels = order_sites)
+)
+
+# --- 3. UPDATED PLOTTING FUNCTIONS ---
+
+# Alpha Plot Function
+create_alpha_plot <- function(data, metric, y_label, label_tag, main_title) {
+  form <- as.formula(paste(metric, "~ all_bodysite"))
+  kw_res <- kruskal.test(form, data = data)
+  kw_p <- format.pval(kw_res$p.value, digits = 3, eps = 0.001)
+  pair_res <- data %>% wilcox_test(form, p.adjust.method = "BH") %>%
+    add_significance() %>% add_xy_position(x = "all_bodysite")
+  
+  stats_sub <- paste0("Global Kruskal-Wallis: p = ", kw_p, " | Pairwise: Wilcoxon (BH corrected)")
+  n_labs <- data %>% group_by(all_bodysite) %>% summarise(n = n())
+  
+  ggplot(data, aes_string(x = "all_bodysite", y = metric)) +
+    geom_boxplot(aes(fill = all_bodysite), outlier.shape = NA, lwd = 1.2, alpha = 0.7, show.legend = FALSE) +
+    geom_jitter(aes(fill = all_bodysite), shape = 21, size = 4.5, width = 0.2, color = "black", stroke = 1, show.legend = FALSE) +
+    scale_fill_manual(values = group_colors) +
+    scale_x_discrete(labels = paste0(n_labs$all_bodysite, "\n(n=", n_labs$n, ")")) +
+    labs(title = paste(label_tag, main_title), subtitle = stats_sub, x = "", y = y_label) +
+    theme_bw(base_size = 22) +
+    theme(text = element_text(face = "bold"),
+          plot.title = element_text(size = 24),
+          plot.subtitle = element_text(size = 18, face = "italic", color = "black"),
+          axis.text.x = element_text(size = 16, color = "black"),
+          panel.grid.minor = element_blank()) +
+    stat_pvalue_manual(pair_res, label = "p.adj.signif", hide.ns = TRUE, size = 10, bracket.size = 1.2, vjust = 0.5)
+}
+
+# Beta Plot Function
+create_beta_plot <- function(ps_obj, dist_method, title_label, label_tag, show_legend = FALSE) {
+  dist_mat <- phyloseq::distance(ps_obj, method = dist_method)
+  set.seed(123)
+  perm_res <- adonis2(dist_mat ~ all_bodysite, data = meta_mom)
+  r2_val   <- round(perm_res$R2[1], 3)
+  p_val    <- perm_res$`Pr(>F)`[1]
+  p_lab    <- if(p_val < 0.001) "p < 0.001" else paste0("p = ", round(p_val, 3))
+  
+  stats_sub <- paste0("PERMANOVA: R² = ", r2_val, " | Global p-value: ", p_lab)
+  
+  pcoa <- cmdscale(dist_mat, eig = TRUE)
+  var_exp <- round(100 * pcoa$eig / sum(pcoa$eig), 1)
+  df <- data.frame(Axis.1 = pcoa$points[,1], Axis.2 = pcoa$points[,2], 
+                   Site = factor(meta_mom$all_bodysite, levels = order_sites))
+  n_lab <- paste0(levels(df$Site), " (n=", as.numeric(table(df$Site)), ")")
+  
+  p <- ggplot(df, aes(Axis.1, Axis.2, fill = Site)) +
+    stat_ellipse(aes(color = Site), level = 0.95, linewidth = 1.2, show.legend = FALSE) +
+    geom_point(shape = 21, size = 6, color = "black", stroke = 1, show.legend = show_legend) +
+    scale_fill_manual(values = group_colors, labels = n_lab) +
+    scale_color_manual(values = group_colors, guide = "none") + 
+    labs(title = paste(label_tag, title_label), subtitle = stats_sub,
+         x = paste0("PCoA 1 (", var_exp[1], "%)"), y = paste0("PCoA 2 (", var_exp[2], "%)"), fill = "Body Site") +
+    theme_bw(base_size = 22) +
+    theme(text = element_text(face = "bold"),
+          plot.title = element_text(size = 24),
+          plot.subtitle = element_text(size = 18, face = "italic"),
+          panel.border = element_rect(linewidth = 1.5))
+  
+  if (!show_legend) { p <- p + theme(legend.position = "none") } else { p <- p + theme(legend.position = "right") }
+  return(p)
+}
+
+# --- 4. GENERATE AND ASSEMBLE MOTHER FIGURES ---
+
+# Main Figure 2 (Mother)
+p_shannon_mom <- create_alpha_plot(adiv_mom, "Shannon", "Shannon Index", "(A)", "Maternal Shannon Diversity")
+p_bray_mom    <- create_beta_plot(ps.counts.mom, "bray", "Maternal Bray-Curtis Dissimilarity", "(B)", show_legend = TRUE)
+
+main_fig_mom <- (p_shannon_mom / p_bray_mom) + 
+  plot_annotation(title = "Figure 2: Maternal and Neonatal Microbiome Diversity Across Body Sites",
+                  theme = theme(plot.title = element_text(size = 24, face = "bold")))
+
+# Supplementary Figure Mother (A-C Alpha, D-F Beta)
+p_obs_mom    <- create_alpha_plot(adiv_mom, "Observed", "Observed ASVs", "(A)", "Observed Richness")
+p_faith_mom  <- create_alpha_plot(adiv_mom, "FaithPD", "Faith's PD", "(B)", "Phylogenetic Diversity")
+p_pielou_mom <- create_alpha_plot(adiv_mom, "Pielou", "Pielou's Evenness", "(C)", "Community Evenness")
+
+p_wunifrac_mom <- create_beta_plot(ps.counts.mom, "wunifrac", "Weighted UniFrac", "(D)", show_legend = FALSE)
+p_unifrac_mom  <- create_beta_plot(ps.counts.mom, "unifrac", "Unweighted UniFrac", "(E)", show_legend = FALSE)
+p_jaccard_mom  <- create_beta_plot(ps.counts.mom, "jaccard", "Jaccard Index", "(F)", show_legend = TRUE)
+
+supp_fig_mom <- (p_obs_mom | p_faith_mom | p_pielou_mom) / (p_wunifrac_mom | p_unifrac_mom | p_jaccard_mom) + 
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(title = "Supplementary Figure S1: Mother Additional Diversity Metrics",
+                  theme = theme(plot.title = element_text(size = 24, face = "bold")))
+
+# Save Final Versions for Mothers
+ggsave("Figure_2_Mother_Final.png", main_fig_mom, width = 12, height = 18, dpi = 300)
+ggsave("Supplementary_Figure_Mother_Final.png", supp_fig_mom, width = 28, height = 16, dpi = 300)
+# ==============================================================================
